@@ -1,0 +1,6 @@
+[
+  {
+    "caption": "dprint: Show Version",
+    "command": "dprint_show_version"
+  }
+]
