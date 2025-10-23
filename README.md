@@ -17,3 +17,16 @@ runs [dprint](https://dprint.dev/) after each save if a directory contains dprin
 2. Prepare submition
 
 3. Remove logs
+
+## Install
+
+Install [Sublime Text 3](https://www.sublimetext.com/), if not installed.
+Also install [dprint](https://dprint.dev/install/) globaly.
+
+For mac (path may vary):
+
+```
+cd Library/Application\ Support/Sublime\ Text\ 3/Packages/User
+```
+
+Add `dprint_on_save.py` there and restart.
