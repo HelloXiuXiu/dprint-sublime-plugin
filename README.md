@@ -1,6 +1,6 @@
 # Sublime Text dprint plugin
 
-runs [dprint](https://dprint.dev/) after each save if a directory contains dprint.json
+runs [dprint](https://dprint.dev/) after each save if a directory contains `dprint.json`
 
 ## Requirments:
 
@@ -8,11 +8,11 @@ runs [dprint](https://dprint.dev/) after each save if a directory contains dprin
 
 2. Save all changes after formating
 
-3. Mind vertical changes indicator (yellow or grin line on the left)
+3. Mind vertical change indicator (yellow or grin line on the left)
 
 ## TO-DO:
 
-1. Make sure it doesn't mess up with other auto-formating plugins (now it breack error text of PrettierFormat plugin)
+1. Make sure it doesn't mess up with other auto-formating plugins (now it breaks error text of PrettierdFormat plugin)
 
 2. Prepare submition
 
