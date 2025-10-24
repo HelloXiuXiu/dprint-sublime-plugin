@@ -1,14 +1,11 @@
 import os
 import threading
 import subprocess
-import time
 import re
 import sublime
 import sublime_plugin
 
-# --- Config ---
-SUPPORTED_EXTS = (".js", ".jsx", ".ts", ".tsx", ".json", ".css", ".html", ".md", ".toml", ".yaml", ".yml")
-DEBOUNCE_MS = 150  # small delay to reduce race conditions with other on-save plugins
+# === Utilities ===
 
 ANSI_ESCAPE_RE = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
 
@@ -32,6 +29,7 @@ def write_panel(window, text):
     on_main_thread(_append)
 
 def find_dprint_config(start_path: str):
+    """Walk up from start_path to find nearest dprint.json / dprint.jsonc. Return absolute path or None."""
     cur = start_path
     while True:
         for name in ("dprint.json", "dprint.jsonc"):
@@ -44,6 +42,7 @@ def find_dprint_config(start_path: str):
         cur = parent
 
 def which(cmd: str):
+    """Cross-platform 'which' suitable for Sublime envs (Windows/macOS/Linux)."""
     paths = os.environ.get("PATH", "").split(os.pathsep)
     exts = [""] + os.environ.get("PATHEXT", "").split(os.pathsep)
     for path in paths:
@@ -54,19 +53,73 @@ def which(cmd: str):
                 return c
     return None
 
+def handled_by_dprint(file_path: str, config_path: str) -> bool:
+    """
+    Ask dprint whether this file is covered by user's config/plugins.
+    Prefer 'dprint output-file-paths <file> --config <config>'.
+    Fallback: allow 'fmt' to decide and we will quietly skip if it says 'no files'.
+    """
+    dprint_bin = which("dprint") or "dprint"
+    try:
+        proc = subprocess.run(
+            [dprint_bin, "output-file-paths", file_path, "--config", config_path],
+            cwd=os.path.dirname(file_path),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True
+        )
+        if proc.returncode == 0:
+            out = strip_ansi(proc.stdout).strip()
+            if not out:
+                return False
+            fname = os.path.basename(file_path)
+            return any(os.path.basename(line.strip()) == fname for line in out.splitlines())
+        # If command is unsupported or returns non-zero, fall back to letting 'fmt' decide.
+        return True
+    except Exception:
+        # If probing fails (older dprint, env), fall back to 'fmt' path.
+        return True
+
+# === Per-file serialization (no debounce) ===
+_running_lock = threading.Lock()
+_running_by_path = {}     # file_path -> threading.Event
+_pending_by_path = set()  # file paths with a pending rerun request
+
+def _start_or_mark_pending(file_path: str, runner_factory):
+    with _running_lock:
+        if file_path in _running_by_path:
+            _pending_by_path.add(file_path)
+            return None
+        ev = threading.Event()
+        _running_by_path[file_path] = ev
+        return runner_factory(ev)
+
+def _finish_and_maybe_rerun(file_path: str, view, config_path, runner_cls):
+    with _running_lock:
+        ev = _running_by_path.pop(file_path, None)
+        if ev:
+            ev.set()
+        rerun = file_path in _pending_by_path
+        if rerun:
+            _pending_by_path.discard(file_path)
+            # Re-queue one more run on the next tick (no fixed delay)
+            def _requeue():
+                runner = runner_cls(view, file_path, config_path)
+                runner.start()
+            on_main_thread(_requeue)
+
+# === Runner & EventListener ===
+
 class DprintRunner(threading.Thread):
-    def __init__(self, view: sublime.View, file_path: str, config_path: str, delay_ms: int = DEBOUNCE_MS):
+    def __init__(self, view: sublime.View, file_path: str, config_path: str, done_event: threading.Event = None):
         super().__init__(daemon=True)
         self.view = view
         self.window = view.window() or sublime.active_window()
         self.file_path = file_path
         self.config_path = config_path
-        self.delay_ms = delay_ms
+        self._done_event = done_event
 
     def run(self):
-        # Debounce to avoid colliding with other on-save plugins
-        time.sleep(max(0, self.delay_ms) / 1000.0)
-
         dprint_bin = which("dprint") or "dprint"
         try:
             cmd = [dprint_bin, "fmt", self.file_path, "--config", self.config_path]
@@ -81,17 +134,23 @@ class DprintRunner(threading.Thread):
             stderr = strip_ansi(proc.stderr)
 
             if proc.returncode != 0:
+                low = (stdout + "\n" + stderr).lower()
+                # If this file isn't matched by config, dprint may say "no files" / "no matching files" — skip quietly.
+                if "no files" in low or "no matching files" in low:
+                    return
                 write_panel(self.window, "dprint fmt failed (exit {}):\n\nSTDOUT:\n{}\n\nSTDERR:\n{}".format(
                     proc.returncode, stdout, stderr
                 ))
                 return
 
-            # If formatter modified the file on disk, pick changes in the view.
+            # Pick up on-disk changes, if any.
             on_main_thread(self._maybe_revert)
         except FileNotFoundError:
             write_panel(self.window, "dprint binary not found in PATH. Install from https://dprint.dev/")
         except Exception as e:
             write_panel(self.window, "Unexpected error: {}".format(e))
+        finally:
+            _finish_and_maybe_rerun(self.file_path, self.view, self.config_path, lambda v, fp, cp: DprintRunner(v, fp, cp))
 
     def _maybe_revert(self):
         v = self.view
@@ -107,29 +166,42 @@ class DprintRunner(threading.Thread):
             v.run_command("revert")
 
 class DprintOnSave(sublime_plugin.EventListener):
-    _lock = threading.Lock()
-    _busy = set()  # view.id() currently formatting
+    _local_lock = threading.Lock()
+    _busy = set()  # simple per-view recursion guard
 
     def on_post_save_async(self, view: sublime.View):
         vid = view.id()
-        with self._lock:
+        with self._local_lock:
             if vid in self._busy:
                 return
             self._busy.add(vid)
 
         try:
             file_path = view.file_name()
-            if not file_path or not file_path.endswith(SUPPORTED_EXTS):
-                return  # quiet skip
+            if not file_path:
+                return
 
             folder = os.path.dirname(file_path)
             config_path = find_dprint_config(folder)
             if not config_path:
-                return  # quiet skip if no config up the tree
+                return  # no dprint config in project => exit immediately (fast path)
 
-            DprintRunner(view, file_path, config_path).start()
+            # Ask dprint if this file is covered by user's config/plugins
+            if not handled_by_dprint(file_path, config_path):
+                return  # not handled => silent skip
+
+            # Start on next tick and serialize per file (no fixed delays)
+            def _start_runner():
+                runner = _start_or_mark_pending(
+                    file_path,
+                    lambda done_ev=None: DprintRunner(view, file_path, config_path, done_ev)
+                )
+                if runner:
+                    runner.start()
+
+            on_main_thread(_start_runner)
         finally:
-            with self._lock:
+            with self._local_lock:
                 self._busy.discard(vid)
 
 # Optional command to quickly check availability
