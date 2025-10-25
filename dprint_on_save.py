@@ -1,127 +1,165 @@
-import sublime
-import sublime_plugin
-import subprocess
-import os
-import threading
+"""
+dprint on save — Sublime Text 4 plugin (v1.4-mac-friendly)
+----------------------------------------------------------
+Runs dprint automatically after each file save, if a nearby dprint.json/jsonc exists.
 
+Changes vs v1.3:
+- Reads stdout/stderr as raw bytes → cleans all ANSI escapes (mac-safe)
+- “Quiet” mode: panel shows only on error (no flicker)
+- Still serialized per-file, no debounce
+"""
 
-def find_dprint_config(start_path):
-    """Find nearest dprint.json or dprint.jsonc up the directory tree."""
-    current = start_path
+import os, re, threading, subprocess, sublime, sublime_plugin
+
+# --------------------------------------------------------------------------
+# ANSI cleaner
+# --------------------------------------------------------------------------
+ANSI_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
+def strip_ansi(text):
+    return ANSI_RE.sub("", text or "")
+
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
+def on_main_thread(fn, *a, **kw): sublime.set_timeout(lambda: fn(*a, **kw), 0)
+
+def get_panel(win):
+    p = win.create_output_panel("dprint")
+    p.set_read_only(False)
+    return p
+
+def write_panel(win, msg, show=True):
+    def _append():
+        p = get_panel(win)
+        p.run_command("append", {"characters": msg + "\n"})
+        if show:
+            win.run_command("show_panel", {"panel": "output.dprint"})
+        p.set_read_only(True)
+    on_main_thread(_append)
+
+# --------------------------------------------------------------------------
+# find config / which
+# --------------------------------------------------------------------------
+def find_dprint_config(start):
+    cur = start
     while True:
         for name in ("dprint.json", "dprint.jsonc"):
-            config_path = os.path.join(current, name)
-            if os.path.exists(config_path):
-                print(f"[dprint] Found config: {config_path}")
-                return config_path
-        parent = os.path.dirname(current)
-        if parent == current:
-            print("[dprint] No config found.")
-            return None
-        current = parent
+            p = os.path.join(cur, name)
+            if os.path.isfile(p): return p
+        parent = os.path.dirname(cur)
+        if parent == cur: return None
+        cur = parent
 
+def which(cmd):
+    paths = os.environ.get("PATH", "").split(os.pathsep)
+    exts  = [""] + os.environ.get("PATHEXT", "").split(os.pathsep)
+    for d in paths:
+        for e in exts:
+            c = os.path.join(d, cmd + e)
+            if os.path.isfile(c) and os.access(c, os.X_OK): return c
+    return None
 
-class DprintFormatThread(threading.Thread):
-    def __init__(self, view, file_path, config_path):
-        super().__init__()
-        self.view = view
-        self.file_path = file_path
-        self.config_path = config_path
+# --------------------------------------------------------------------------
+# concurrency
+# --------------------------------------------------------------------------
+_lock = threading.Lock()
+_running, _pending = {}, set()
+
+def _start_or_pending(path, factory):
+    with _lock:
+        if path in _running:
+            _pending.add(path); return None
+        ev = threading.Event(); _running[path] = ev; return factory(ev)
+
+def _finish(path, view, cfg, cls):
+    with _lock:
+        ev = _running.pop(path, None)
+        if ev: ev.set()
+        if path in _pending:
+            _pending.discard(path)
+            on_main_thread(lambda: cls(view, path, cfg).start())
+
+# --------------------------------------------------------------------------
+# worker
+# --------------------------------------------------------------------------
+class DprintRunner(threading.Thread):
+    def __init__(self, view, path, cfg, done=None):
+        threading.Thread.__init__(self, daemon=True)
+        self.view, self.window, self.path, self.cfg, self._done = (
+            view, view.window() or sublime.active_window(), path, cfg, done)
 
     def run(self):
+        bin = which("dprint") or "dprint"
         try:
-            print(f"[dprint] Formatting started for: {self.file_path}")
-            original_code = self.view.substr(sublime.Region(0, self.view.size()))
+            proc = subprocess.Popen(
+                [bin, "fmt", self.path, "--config", self.cfg],
+                cwd=os.path.dirname(self.path),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            out_b, err_b = proc.communicate()
+            out = strip_ansi(out_b.decode("utf-8", "ignore"))
+            err = strip_ansi(err_b.decode("utf-8", "ignore"))
 
-            cmd = [
-                "dprint",
-                "fmt",
-                f"--stdin={self.file_path}",
-                "--config",
-                self.config_path,
-            ]
-            print("[dprint] Running:", " ".join(cmd))
+            if proc.returncode != 0:
+                low = (out + err).lower()
+                if "no files" in low or "no matching files" in low: return
+                write_panel(self.window,
+                    f"dprint fmt failed (exit {proc.returncode}):\n\nSTDOUT:\n{out}\n\nSTDERR:\n{err}",
+                    show=True)
+                return
 
-            result = subprocess.run(
-                cmd,
-                input=original_code,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
+            # success → silent
+            on_main_thread(self._maybe_revert)
 
-            if result.returncode == 0:
-                formatted = result.stdout
-                if formatted and formatted.strip() != original_code.strip():
-                    sublime.set_timeout(lambda: self._apply_edit(formatted), 0)
-                    print("[dprint] File formatted successfully.")
-                else:
-                    print("[dprint] No formatting changes needed.")
-            else:
-                print("[dprint] Error:")
-                print(result.stderr)
+        except FileNotFoundError:
+            write_panel(self.window, "dprint binary not found in PATH. Install from https://dprint.dev/")
         except Exception as e:
-            print("[dprint] Exception:", e)
+            write_panel(self.window, f"Unexpected error: {e}")
+        finally:
+            _finish(self.path, self.view, self.cfg, lambda v, p, c: DprintRunner(v, p, c))
 
-    def _apply_edit(self, formatted):
-        """Replace file content and auto-save silently."""
-        self.view.run_command("dprint_replace_content", {"text": formatted})
+    def _maybe_revert(self):
+        v = self.view
+        if not v or v.is_loading() or v.is_dirty(): return
+        try:
+            disk = open(self.path, "rb").read()
+        except Exception: return
+        buf = v.substr(sublime.Region(0, v.size())).encode("utf-8", "replace")
+        if buf != disk: v.run_command("revert")
 
-        def save_after_format():
-            if self.view.is_dirty():
-                self.view.run_command("save")
-            sublime.status_message("Formatted and saved with dprint")
-
-        # Wait a tiny bit for Sublime to mark buffer dirty before saving
-        sublime.set_timeout(save_after_format, 50)
-
-
-class DprintReplaceContentCommand(sublime_plugin.TextCommand):
-    def run(self, edit, text):
-        old = self.view.substr(sublime.Region(0, self.view.size()))
-        if old == text:
-            # Nothing changed — skip to avoid gutter flicker
-            return
-
-        # Compute minimal diff region
-        prefix_len = 0
-        while prefix_len < len(old) and prefix_len < len(text) and old[prefix_len] == text[prefix_len]:
-            prefix_len += 1
-
-        suffix_len = 0
-        while suffix_len < len(old) - prefix_len and suffix_len < len(text) - prefix_len and \
-                old[-(suffix_len + 1)] == text[-(suffix_len + 1)]:
-            suffix_len += 1
-
-            # Avoid overlapping
-            if suffix_len + prefix_len > len(old) or suffix_len + prefix_len > len(text):
-                suffix_len = 0
-                break
-
-        start = prefix_len
-        end_old = len(old) - suffix_len
-        end_new = len(text) - suffix_len
-
-        region = sublime.Region(start, end_old)
-        new_content = text[start:end_new]
-        self.view.replace(edit, region, new_content)
-
-
+# --------------------------------------------------------------------------
+# event listener
+# --------------------------------------------------------------------------
 class DprintOnSave(sublime_plugin.EventListener):
-    def on_post_save(self, view):
-        file_path = view.file_name()
-        if not file_path:
-            print("[dprint] No file path.")
-            return
+    _l, _busy = threading.Lock(), set()
+    def on_post_save_async(self, view):
+        vid = view.id()
+        with self._l:
+            if vid in self._busy: return
+            self._busy.add(vid)
+        try:
+            path = view.file_name()
+            if not path: return
+            cfg = find_dprint_config(os.path.dirname(path))
+            if not cfg: return
+            def start():
+                r = _start_or_pending(path, lambda ev=None: DprintRunner(view, path, cfg, ev))
+                if r: r.start()
+            on_main_thread(start)
+        finally:
+            with self._l: self._busy.discard(vid)
 
-        if not file_path.endswith((".js", ".jsx", ".ts", ".tsx", ".json", ".css", ".html", ".md")):
-            print(f"[dprint] Skipped (unsupported file): {file_path}")
-            return
-
-        folder = os.path.dirname(file_path)
-        config_path = find_dprint_config(folder)
-        if not config_path:
-            print("[dprint] No config found — skipping.")
-            return
-
-        DprintFormatThread(view, file_path, config_path).start()
+# --------------------------------------------------------------------------
+# command — show version
+# --------------------------------------------------------------------------
+class DprintShowVersionCommand(sublime_plugin.WindowCommand):
+    def run(self):
+        bin = which("dprint") or "dprint"
+        try:
+            p = subprocess.Popen([bin, "--version"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            out_b, err_b = p.communicate()
+            out = strip_ansi((out_b or err_b).decode("utf-8", "ignore"))
+            msg = f"dprint {out.strip()}" if p.returncode == 0 else f"dprint error:\n{out.strip()}"
+        except FileNotFoundError:
+            msg = "dprint binary not found in PATH."
+        sublime.message_dialog(msg)
